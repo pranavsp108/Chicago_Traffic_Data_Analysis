@@ -1,0 +1,15 @@
+# RStudio and R specific files
+.Rhistory
+.RData
+
+# macOS-specific files
+.DS_Store
+
+# Cache files (especially if you use cache=TRUE in Rmd)
+*_cache/
+*\_files/
+
+# Large or unnecessary outputs
+# Since you uploaded Project.docx, you can choose to keep it, but 
+# if you want to regenerate it from the Rmd, ignore it.
+# Project.docx
