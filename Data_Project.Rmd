@@ -1,0 +1,408 @@
+---
+title: "Project"
+author: "Pranav Padmannavar"
+date: "2025-05-14"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r}
+# ── Section 1: Problem & goal statement ───────────────────────────────────────
+
+# Install & load dplyr
+if (!requireNamespace("dplyr", quietly=TRUE)) install.packages("dplyr")
+library(dplyr)
+
+# Read in the crash data (update path as needed)
+CTC <- read.csv("/Users/pranavsp108/Desktop/Semester 2/Analytics/Project/Data Analytics Project/ChicagoTrafficCrash.csv", stringsAsFactors = FALSE)
+
+# Define binary response: 1 = Fatal or Incapacitating Injury; 0 = other
+CTC <- CTC %>%
+  mutate(SevereInjury = if_else(
+    MOST_SEVERE_INJURY %in% c("FATAL", "INCAPACITATING INJURY"),
+    1L, 0L
+  ))
+
+# Check class balance
+counts <- table(CTC$SevereInjury)
+props  <- prop.table(counts)
+print(counts)
+print(round(props, 3))
+```
+
+```{r}
+# ── Section 2: Data audit & wrangling ────────────────────────────────────────
+
+# Install & load packages
+for (pkg in c("naniar","forcats","rsample")) {
+  if (!requireNamespace(pkg, quietly=TRUE)) install.packages(pkg)
+  library(pkg, character.only=TRUE)
+}
+
+# Copy for cleaning
+df2 <- CTC
+
+# 2.1 Missing‐value map
+vis_miss(df2)
+
+# 2.2 Collapse rare levels (<1%)
+cat_vars <- c(
+  "WEATHER_CONDITION", "LIGHTING_CONDITION", "FIRST_CRASH_TYPE",
+  "TRAFFICWAY_TYPE", "ALIGNMENT", "ROADWAY_SURFACE_COND",
+  "ROAD_DEFECT", "REPORT_TYPE", "CRASH_TYPE",
+  "INTERSECTION_RELATED_I", "DAMAGE",
+  "PRIM_CONTRIBUTORY_CAUSE", "SEC_CONTRIBUTORY_CAUSE"
+)
+min_n <- floor(0.01 * nrow(df2))
+df2 <- df2 %>%
+  mutate(across(all_of(cat_vars),
+                ~ fct_lump_min(as.factor(.), min = min_n, other_level = "Other")))
+
+# 2.3 One‐hot encoding for GLM
+X_mat <- model.matrix(~ . - 1, data = df2[, cat_vars])
+cat("Dummy matrix dimensions:", dim(X_mat), "\n")
+
+# 2.4 Stratified 70/30 split
+set.seed(2025)
+split <- initial_split(df2, prop = 0.7, strata = "SevereInjury")
+train  <- training(split)
+test   <- testing(split)
+cat("Train/Test sizes:", nrow(train), "/", nrow(test), "\n")
+cat("Train severe %:", round(prop.table(table(train$SevereInjury))[2],3),
+    "Test severe %:", round(prop.table(table(test$SevereInjury))[2],3), "\n")
+
+```
+
+```{r}
+# ── Section 3: Exploratory association analysis ───────────────────────────────
+
+library(dplyr)
+
+assoc_list <- lapply(cat_vars, function(var) {
+  tbl       <- table(df2[[var]], df2$SevereInjury)
+  chisq_res <- suppressWarnings(chisq.test(tbl))
+  chi2      <- as.numeric(chisq_res$statistic)
+  df_       <- as.numeric(chisq_res$parameter)
+  p_val     <- as.numeric(chisq_res$p.value)
+  n         <- sum(tbl)
+  k         <- min(nrow(tbl), ncol(tbl))
+  cram_v    <- sqrt(chi2 / (n * (k - 1)))
+  data.frame(
+    variable  = var,
+    chi_sq    = chi2,
+    df        = df_,
+    p_value   = p_val,
+    cramers_V = cram_v,
+    stringsAsFactors = FALSE
+  )
+})
+assoc_df <- bind_rows(assoc_list) %>% arrange(desc(cramers_V))
+print(head(assoc_df, 10))
+
+
+```
+
+```{r}
+# ── Section 4: Baseline classifiers (GLM, LDA, QDA) ───────────────────────────
+
+library(MASS)
+library(caret)
+library(pROC)
+
+# 4.1 Prepare factor response
+train$SevereFactor <- factor(train$SevereInjury, levels = c(0,1), labels = c("no","yes"))
+test$SevereFactor  <- factor(test$SevereInjury,  levels = c(0,1), labels = c("no","yes"))
+
+preds <- cat_vars
+
+# 4.2 Logistic regression
+glm_mod <- glm(
+  formula = as.formula(paste("SevereFactor ~", paste(preds, collapse = " + "))),
+  data    = train,
+  family  = binomial
+)
+print(summary(glm_mod))
+
+test$glm_prob <- predict(glm_mod, newdata = test, type = "response")
+test$glm_pred <- factor(ifelse(test$glm_prob > 0.5, "yes", "no"),
+                        levels = c("no","yes"))
+cm_glm  <- confusionMatrix(test$glm_pred, test$SevereFactor, positive = "yes")
+auc_glm <- roc(as.numeric(test$SevereFactor) - 1, test$glm_prob)$auc
+print(cm_glm); cat("GLM AUC:", round(auc_glm, 3), "\n\n")
+
+# 4.3 Linear Discriminant Analysis (LDA)
+lda_mod      <- lda(SevereFactor ~ ., data = train[, c("SevereFactor", preds)])
+test$lda_pred <- predict(lda_mod, newdata = test)$class
+cm_lda <- confusionMatrix(test$lda_pred, test$SevereFactor, positive = "yes")
+print(cm_lda); cat("\n")
+
+# 4.4 Quadratic Discriminant Analysis (QDA)
+qda_mod      <- qda(SevereFactor ~ ., data = train[, c("SevereFactor", preds)])
+test$qda_pred <- predict(qda_mod, newdata = test)$class
+cm_qda <- confusionMatrix(test$qda_pred, test$SevereFactor, positive = "yes")
+print(cm_qda)
+
+```
+
+```{r}
+# ── Section 5: Regularized logistic (glmnet) w/ Youden cutoff ────────────────
+
+if (!requireNamespace("glmnet", quietly=TRUE)) install.packages("glmnet")
+library(glmnet)
+
+# 5.1 Prepare design matrices
+predictor_vars <- c("POSTED_SPEED_LIMIT", cat_vars)
+x_train <- model.matrix(~ . - 1, data = train[, predictor_vars])
+y_train <- train$SevereInjury
+x_test  <- model.matrix(~ . - 1, data = test[,  predictor_vars])
+y_test  <- test$SevereInjury
+
+# 5.2 5‐fold CV for λ (LASSO)
+set.seed(2025)
+cvfit <- cv.glmnet(
+  x_train, y_train,
+  family       = "binomial",
+  alpha        = 1,
+  nfolds       = 5,
+  type.measure = "auc"
+)
+lambda_min <- cvfit$lambda.min
+lambda_1se  <- cvfit$lambda.1se
+cat("lambda.min =", round(lambda_min,5),
+    "  lambda.1se =", round(lambda_1se,5), "\n")
+cat("Non-zero @ lambda.min:", sum(coef(cvfit,s="lambda.min")!=0)-1, "\n")
+cat("Non-zero @ lambda.1se:", sum(coef(cvfit,s="lambda.1se")!=0)-1, "\n\n")
+
+# 5.3 Final LASSO & predictions
+lasso_mod       <- glmnet(x_train, y_train, family="binomial",
+                          alpha=1, lambda=lambda_1se)
+pred_prob_lasso <- as.numeric(predict(lasso_mod, newx=x_test, type="response"))
+roc_lasso       <- roc(y_test, pred_prob_lasso)
+auc_lasso       <- auc(roc_lasso)
+cat("Lasso AUC (0.5 cutoff):", round(auc_lasso, 3), "\n")
+
+# 5.4 Youden’s J cutoff
+opt <- coords(
+  roc_lasso,
+  x           = "best",
+  best.method = "youden",
+  ret         = c("threshold","sensitivity","specificity")
+)
+print(opt)
+thresh <- opt[1, "threshold"]
+pred_class_opt <- factor(
+  ifelse(pred_prob_lasso > thresh, "yes", "no"),
+  levels = c("no","yes")
+)
+cm_opt <- confusionMatrix(pred_class_opt, test$SevereFactor, positive="yes")
+cat("\nConfusion matrix at Youden threshold (", round(thresh,3), "):\n", sep="")
+print(cm_opt)
+```
+
+```{r, cache=TRUE}
+# ── Section 6: Tree-based learners ────────────────────────────────────────────
+
+library(caret)
+library(pROC)
+set.seed(2025)
+
+tc        <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary
+)
+preds_all <- c("POSTED_SPEED_LIMIT", cat_vars)
+
+# 6.1 CART
+cart_fit <- caret::train(
+  x         = train[, preds_all],
+  y         = train$SevereFactor,
+  method    = "rpart",
+  trControl = tc,
+  metric    = "ROC",
+  tuneLength= 10
+)
+print(cart_fit); plot(cart_fit)
+
+# 6.2 Bagging (RF with mtry = p)
+bag_fit <- caret::train(
+  x        = train[, preds_all],
+  y        = train$SevereFactor,
+  method   = "rf",
+  trControl= tc,
+  metric   = "ROC",
+  tuneGrid = data.frame(mtry = length(preds_all)),
+  ntree    = 500
+)
+print(bag_fit)
+
+# 6.3 Random Forest (tune mtry)
+rf_fit <- caret::train(
+  x        = train[, preds_all],
+  y        = train$SevereFactor,
+  method   = "rf",
+  trControl= tc,
+  metric   = "ROC",
+  tuneGrid = expand.grid(mtry = seq(5, length(preds_all), by = 10)),
+  ntree    = 500
+)
+print(rf_fit)
+
+# 6.4 Gradient Boosting Machine (GBM)
+gbm_fit <- caret::train(
+  x          = train[, preds_all],
+  y          = train$SevereFactor,
+  method     = "gbm",
+  trControl  = tc,
+  metric     = "ROC",
+  verbose    = FALSE,
+  tuneLength = 5
+)
+print(gbm_fit)
+
+# 6.5 Variable importance from RF
+vi <- varImp(rf_fit)
+print(head(vi$importance[order(-vi$importance$Overall), , drop=FALSE], 10))
+plot(vi, top = 10)
+```
+
+```{r}
+# ── Section 7: Model comparison ───────────────────────────────────────────────
+
+probs_cart  <- predict(cart_fit, newdata = test, type = "prob")[, "yes"]
+probs_bag   <- predict(bag_fit,  newdata = test, type = "prob")[, "yes"]
+probs_rf    <- predict(rf_fit,   newdata = test, type = "prob")[, "yes"]
+probs_gbm   <- predict(gbm_fit,  newdata = test, type = "prob")[, "yes"]
+probs_lasso <- pred_prob_lasso
+
+roc_cart  <- roc(test$SevereInjury, probs_cart)
+roc_bag   <- roc(test$SevereInjury, probs_bag)
+roc_rf    <- roc(test$SevereInjury, probs_rf)
+roc_gbm   <- roc(test$SevereInjury, probs_gbm)
+roc_lasso <- roc(test$SevereInjury, probs_lasso)
+
+cat("AUCs on test set:\n")
+cat(sprintf("  Lasso: %.3f\n", auc(roc_lasso)))
+cat(sprintf("  CART:  %.3f\n", auc(roc_cart)))
+cat(sprintf("  Bag:   %.3f\n", auc(roc_bag)))
+cat(sprintf("  RF:    %.3f\n", auc(roc_rf)))
+cat(sprintf("  GBM:   %.3f\n\n", auc(roc_gbm)))
+
+plot(roc_lasso, col = "black",  lwd = 2, main = "Test‐set ROC Comparison")
+lines(roc_cart,  col = "red",    lwd = 2)
+lines(roc_bag,   col = "blue",   lwd = 2)
+lines(roc_rf,    col = "green",  lwd = 2)
+lines(roc_gbm,   col = "purple", lwd = 2)
+legend("bottomright",
+       legend = c("Lasso","CART","Bag","RF","GBM"),
+       col    = c("black","red","blue","green","purple"),
+       lwd    = 2)
+
+```
+
+```{r}
+# ── Section 8: Interpretability & policy translation ─────────────────────────
+
+# 8.1 Lasso odds ratios
+coef_1se <- coef(cvfit, s = "lambda.1se")
+library(tibble)
+lasso_coefs <- tibble(
+  feature   = rownames(coef_1se),
+  estimate  = as.numeric(coef_1se)
+) %>%
+  filter(feature != "(Intercept)") %>%
+  mutate(odds_ratio = exp(estimate)) %>%
+  arrange(desc(abs(estimate))) %>%
+  slice(1:10)
+print(lasso_coefs)
+
+# 8.2 GBM SHAP feature‐importance
+library(fastshap)
+pred_prob_caret <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "yes"]
+}
+set.seed(2025)
+shap_vals <- explain(
+  object       = gbm_fit,
+  X            = train[, predictor_vars],
+  pred_wrapper = pred_prob_caret,
+  nsim         = 50
+)
+shap_imp_df <- tibble(
+  feature       = names(shap_vals),
+  mean_abs_shap = apply(abs(shap_vals), 2, mean)
+) %>% arrange(desc(mean_abs_shap)) %>% slice(1:10)
+print(shap_imp_df)
+
+# 8.3 PDP for POSTED_SPEED_LIMIT
+library(pdp)
+pdp_obj <- partial(
+  object          = gbm_fit,
+  pred.var        = "POSTED_SPEED_LIMIT",
+  train           = train,
+  which.class     = "yes",
+  prob            = TRUE,
+  grid.resolution = 20
+)
+plot(
+  pdp_obj,
+  main = "PDP: P(Severe Injury = yes) vs. Posted Speed Limit",
+  xlab = "Posted Speed Limit (mph)",
+  ylab = "Predicted Probability"
+)
+```
+
+```{r}
+# ── Section 9: Multiple Correspondence Analysis (MCA) ─────────────────────────
+
+if (!requireNamespace("FactoMineR", quietly=TRUE)) install.packages("FactoMineR")
+if (!requireNamespace("factoextra", quietly=TRUE)) install.packages("factoextra")
+library(FactoMineR)
+library(factoextra)
+
+# 9.1 Prepare categorical data
+mca_data <- df2[, cat_vars]
+for (i in seq_along(mca_data)) mca_data[[i]] <- as.factor(mca_data[[i]])
+
+# 9.2 Run MCA
+mca_res <- MCA(mca_data, graph = FALSE)
+
+# 9.3 Scree plot
+fviz_screeplot(
+  mca_res,
+  addlabels = TRUE,
+  ylim      = c(0, 50),
+  title     = "MCA Eigenvalues / % Variance Explained"
+)
+
+# 9.4 Individuals map colored by severe injury
+severe_factor <- factor(
+  df2$SevereInjury,
+  levels = c(0,1),
+  labels = c("no","yes")
+)
+fviz_mca_ind(
+  mca_res,
+  geom         = "point",
+  habillage    = severe_factor,
+  palette      = c("steelblue","tomato"),
+  addEllipses  = TRUE,
+  ellipse.level= 0.95,
+  repel        = TRUE,
+  title        = "MCA: Crash Observations (blue=no, red=yes)"
+)
+
+# 9.5 Top‐10 category coordinates on Dim1 & Dim2
+var_contrib   <- get_mca_var(mca_res)$contrib
+total_contrib <- rowSums(var_contrib[, 1:2])
+top10_cats    <- names(sort(total_contrib, decreasing = TRUE))[1:10]
+fviz_mca_var(
+  mca_res,
+  select.var = list(name = top10_cats),
+  repel      = TRUE,
+  title      = "Top-10 Category Coordinates on Dimensions 1 & 2"
+)
+
+```
